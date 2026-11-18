@@ -44,6 +44,7 @@ describe('Android browsing through the Host bridge', () => {
       detachPeer: vi.fn(async () => undefined),
       useThread: async (_threadId, action) => action(),
       releaseThread: vi.fn(async () => undefined),
+      takeReplay: () => ({ frames: [], truncated: false }),
     }
     const bridge = new CodexPeerBridge(domain,
       { connectionId: 'browse-peer', peerDeviceId: 'phone' }, async () => undefined)

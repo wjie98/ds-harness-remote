@@ -90652,6 +90652,53 @@ function isRecord12(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+// packages/plugin/src/codex/frame-replay.ts
+var CODEX_REPLAY_METHODS = /* @__PURE__ */ new Set([
+  "item/completed",
+  "turn/completed",
+  "thread/status/changed",
+  "thread/name/updated"
+]);
+var CODEX_REPLAY_LIMIT = 200;
+var CODEX_REPLAY_TTL_MS = 5 * 6e4;
+var CodexFrameReplay = class {
+  constructor(limit = CODEX_REPLAY_LIMIT, ttlMs = CODEX_REPLAY_TTL_MS, now = Date.now) {
+    this.limit = limit;
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+  threads = /* @__PURE__ */ new Map();
+  truncated = /* @__PURE__ */ new Set();
+  record(threadId, method, params) {
+    if (!CODEX_REPLAY_METHODS.has(method)) return;
+    const list2 = this.threads.get(threadId) ?? [];
+    list2.push({ method, params, at: this.now() });
+    if (list2.length > this.limit) {
+      list2.shift();
+      this.truncated.add(threadId);
+    }
+    this.threads.set(threadId, list2);
+  }
+  /** Consumes the batch: a later reconnect falls back to history instead. */
+  take(threadId) {
+    const list2 = this.threads.get(threadId);
+    if (list2 === void 0) return { frames: [], truncated: false };
+    this.threads.delete(threadId);
+    const truncated = this.truncated.delete(threadId);
+    const validAfter = this.now() - this.ttlMs;
+    const frames = list2.filter((frame) => frame.at >= validAfter);
+    return { frames, truncated: truncated || frames.length < list2.length };
+  }
+  clear(threadId) {
+    this.threads.delete(threadId);
+    this.truncated.delete(threadId);
+  }
+  clearAll() {
+    this.threads.clear();
+    this.truncated.clear();
+  }
+};
+
 // packages/plugin/src/codex/method-policy.ts
 var id3 = external_exports.string().min(1).max(256);
 var cursor2 = external_exports.string().min(1).max(4096).nullable().optional();
@@ -91098,6 +91145,20 @@ var CodexPeerBridge = class {
       });
       this.requireOpen();
       this.streams.set(params.streamId, params.threadId);
+      const replay = this.domain.takeReplay(params.threadId);
+      for (const frame of replay.frames) {
+        const delivered = await this.publishFrame(params.streamId, params.threadId, {
+          method: frame.method,
+          params: frame.params
+        });
+        if (!delivered) break;
+      }
+      if (replay.truncated) {
+        await this.publishFrame(params.streamId, params.threadId, {
+          method: "codex/stream/truncated",
+          params: { threadId: params.threadId }
+        });
+      }
     });
     return { opened: true, streamId: params.streamId, threadId: params.threadId };
   }
@@ -91235,16 +91296,21 @@ var CodexPeerBridge = class {
     if (this.closed) return;
     const streamIds = [...this.streams.entries()].filter(([, targetThreadId]) => targetThreadId === threadId).map(([streamId]) => streamId);
     for (const streamId of streamIds) {
-      const data2 = { streamId, frame };
-      if (new TextEncoder().encode(JSON.stringify(data2)).byteLength > MAX_SECURE_MESSAGE_BYTES) {
-        this.streams.delete(streamId);
-        void this.domain.releaseThread(threadId);
-        await this.publish("codex.app.stream.closed", { streamId, reason: "failed" });
-        this.logger?.warn("Codex stream closed after oversized frame", { streamId });
-        continue;
-      }
-      await this.publish("codex.app.frame", data2);
+      await this.publishFrame(streamId, threadId, frame);
     }
+  }
+  /** Returns false when the frame closed the Stream instead of being sent. */
+  async publishFrame(streamId, threadId, frame) {
+    const data2 = { streamId, frame };
+    if (new TextEncoder().encode(JSON.stringify(data2)).byteLength > MAX_SECURE_MESSAGE_BYTES) {
+      this.streams.delete(streamId);
+      void this.domain.releaseThread(threadId);
+      await this.publish("codex.app.stream.closed", { streamId, reason: "failed" });
+      this.logger?.warn("Codex stream closed after oversized frame", { streamId });
+      return false;
+    }
+    await this.publish("codex.app.frame", data2);
+    return true;
   }
   async failStreams(reason = "failed") {
     if (this.closed) return;
@@ -91455,6 +91521,8 @@ var CodexRemoteDomain = class {
   turnWatchdogs = /* @__PURE__ */ new Map();
   approvals = /* @__PURE__ */ new Map();
   permissionPresets = /* @__PURE__ */ new Map();
+  /** Terminal frames missed while no Peer was subscribed to the Thread. */
+  frameReplay = new CodexFrameReplay();
   approvalExpiryTimer;
   restartTimer;
   restartAttempt = 0;
@@ -91530,6 +91598,10 @@ var CodexRemoteDomain = class {
     this.peers.set(context.connectionId, bridge);
     this.peerDeviceIds.set(context.connectionId, context.peerDeviceId);
     return bridge;
+  }
+  /** Terminal frames a reconnecting Peer missed before it opened a Stream. */
+  takeReplay(threadId) {
+    return this.frameReplay.take(threadId);
   }
   async call(connectionId, input4) {
     const envelope = parseCallEnvelope(input4);
@@ -91805,6 +91877,7 @@ var CodexRemoteDomain = class {
     if (this.closed) throw new RpcError("CODEX_CLOSED", "The Codex Remote domain is closed.");
     if (JSON.stringify(this.config) === JSON.stringify(config2)) return;
     this.config = config2;
+    this.frameReplay.clearAll();
     this.available = false;
     this.threadLifecycle.reset();
     this.peerThreads.clear();
@@ -91952,6 +92025,7 @@ var CodexRemoteDomain = class {
   }
   async disposeAppServer(appServer) {
     if (appServer === void 0 || this.appServer !== appServer) return;
+    this.frameReplay.clearAll();
     this.unsubscribeInbound?.();
     this.unsubscribeInbound = void 0;
     this.unsubscribeUnavailable?.();
@@ -91979,6 +92053,7 @@ var CodexRemoteDomain = class {
       this.turnOwners.delete(threadId);
       this.clearTurnWatchdog(threadId);
       this.threadLifecycle.closed(threadId);
+      this.frameReplay.clear(threadId);
     }
     if (message.method === "turn/completed" && threadId !== void 0) {
       this.turnOwners.delete(threadId);
@@ -92011,6 +92086,7 @@ var CodexRemoteDomain = class {
     if (message.method === "serverRequest/resolved") this.resolveUpstreamApproval(message.params);
     if (threadId === void 0) return;
     if (this.turnOwners.has(threadId)) this.armTurnWatchdog(threadId);
+    this.frameReplay.record(threadId, message.method, message.params);
     await Promise.all([...this.peers.values()].map((peer) => peer.publishInbound(threadId, {
       method: message.method,
       params: message.params

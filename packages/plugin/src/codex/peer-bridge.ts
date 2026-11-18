@@ -120,6 +120,22 @@ export class CodexPeerBridge {
       })
       this.requireOpen()
       this.streams.set(params.streamId, params.threadId)
+      // Replay terminal frames the previous connection missed. The Stream is
+      // registered first, so any live frame that follows is delivered after.
+      const replay = this.domain.takeReplay(params.threadId)
+      for (const frame of replay.frames) {
+        const delivered = await this.publishFrame(params.streamId, params.threadId, {
+          method: frame.method,
+          params: frame.params,
+        })
+        if (!delivered) break
+      }
+      if (replay.truncated) {
+        await this.publishFrame(params.streamId, params.threadId, {
+          method: 'codex/stream/truncated',
+          params: { threadId: params.threadId },
+        })
+      }
     })
     return { opened: true, streamId: params.streamId, threadId: params.threadId }
   }
@@ -268,16 +284,26 @@ export class CodexPeerBridge {
       .filter(([, targetThreadId]) => targetThreadId === threadId)
       .map(([streamId]) => streamId)
     for (const streamId of streamIds) {
-      const data: CodexAppFrameData = { streamId, frame }
-      if (new TextEncoder().encode(JSON.stringify(data)).byteLength > MAX_SECURE_MESSAGE_BYTES) {
-        this.streams.delete(streamId)
-        void this.domain.releaseThread(threadId)
-        await this.publish('codex.app.stream.closed', { streamId, reason: 'failed' })
-        this.logger?.warn('Codex stream closed after oversized frame', { streamId })
-        continue
-      }
-      await this.publish('codex.app.frame', data)
+      await this.publishFrame(streamId, threadId, frame)
     }
+  }
+
+  /** Returns false when the frame closed the Stream instead of being sent. */
+  private async publishFrame(
+    streamId: string,
+    threadId: string,
+    frame: { method: string; params: unknown },
+  ): Promise<boolean> {
+    const data: CodexAppFrameData = { streamId, frame }
+    if (new TextEncoder().encode(JSON.stringify(data)).byteLength > MAX_SECURE_MESSAGE_BYTES) {
+      this.streams.delete(streamId)
+      void this.domain.releaseThread(threadId)
+      await this.publish('codex.app.stream.closed', { streamId, reason: 'failed' })
+      this.logger?.warn('Codex stream closed after oversized frame', { streamId })
+      return false
+    }
+    await this.publish('codex.app.frame', data)
+    return true
   }
 
   async failStreams(reason: CodexAppStreamClosedData['reason'] = 'failed'): Promise<void> {
