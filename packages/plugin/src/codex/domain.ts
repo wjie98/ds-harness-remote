@@ -16,6 +16,7 @@ import {
   type CodexAppServerInbound,
   type CodexAppServerLike,
 } from './app-server.js'
+import { CodexFrameReplay, type CodexReplayBatch } from './frame-replay.js'
 import {
   isThreadMutation,
   parseCodexCall,
@@ -100,6 +101,8 @@ export class CodexRemoteDomain {
   private readonly turnWatchdogs = new Map<string, ReturnType<typeof setTimeout>>()
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly permissionPresets = new Map<string, CodexPermissionPreset>()
+  /** Terminal frames missed while no Peer was subscribed to the Thread. */
+  private readonly frameReplay = new CodexFrameReplay()
   private approvalExpiryTimer?: ReturnType<typeof setTimeout>
   private restartTimer?: ReturnType<typeof setTimeout>
   private restartAttempt = 0
@@ -192,6 +195,11 @@ export class CodexRemoteDomain {
     this.peers.set(context.connectionId, bridge)
     this.peerDeviceIds.set(context.connectionId, context.peerDeviceId)
     return bridge
+  }
+
+  /** Terminal frames a reconnecting Peer missed before it opened a Stream. */
+  takeReplay(threadId: string): CodexReplayBatch {
+    return this.frameReplay.take(threadId)
   }
 
   async call(connectionId: string, input: unknown): Promise<unknown> {
@@ -505,6 +513,7 @@ export class CodexRemoteDomain {
     if (this.closed) throw new RpcError('CODEX_CLOSED', 'The Codex Remote domain is closed.')
     if (JSON.stringify(this.config) === JSON.stringify(config)) return
     this.config = config
+    this.frameReplay.clearAll()
     this.available = false
     this.threadLifecycle.reset()
     this.peerThreads.clear()
@@ -659,6 +668,7 @@ export class CodexRemoteDomain {
 
   private async disposeAppServer(appServer: CodexAppServerLike | undefined): Promise<void> {
     if (appServer === undefined || this.appServer !== appServer) return
+    this.frameReplay.clearAll()
     this.unsubscribeInbound?.()
     this.unsubscribeInbound = undefined
     this.unsubscribeUnavailable?.()
@@ -688,6 +698,7 @@ export class CodexRemoteDomain {
       this.turnOwners.delete(threadId)
       this.clearTurnWatchdog(threadId)
       this.threadLifecycle.closed(threadId)
+      this.frameReplay.clear(threadId)
     }
     if (message.method === 'turn/completed' && threadId !== undefined) {
       this.turnOwners.delete(threadId)
@@ -726,6 +737,7 @@ export class CodexRemoteDomain {
     if (message.method === 'serverRequest/resolved') this.resolveUpstreamApproval(message.params)
     if (threadId === undefined) return
     if (this.turnOwners.has(threadId)) this.armTurnWatchdog(threadId)
+    this.frameReplay.record(threadId, message.method, message.params)
     await Promise.all([...this.peers.values()].map(peer => peer.publishInbound(threadId, {
       method: message.method,
       params: message.params,
